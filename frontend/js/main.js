@@ -1,302 +1,139 @@
+/**
+ * main.js — 前端装配入口（薄 Glue 层）
+ * 不包含业务逻辑，仅负责：
+ *   1. 装配三大模块: SceneManager + SpinningFrame3D + EfficiencyPanelController
+ *   2. 驱动 requestAnimationFrame 数据更新循环（模拟模式 vs API 模式）
+ *   3. API 生命周期管理（connect/disconnect/data 回调）
+ */
 class App {
     constructor() {
         this.sceneManager = null;
-        this.spinningWheel = null;
-        this.chartManager = null;
-        this.apiClient = apiClient;
-        this.elapsedTime = 0;
-        this.updateInterval = 0.1;
+        this.frame3d = null;
+        this.panel = null;
+        this.api = apiClient;
         this.lastUpdateTime = 0;
-        this.useApi = false;
-        this.currentData = null;
-        this.alarms = [];
-        this.convergenceChart = null;
 
         this.init();
-        this.setupEventListeners();
+        this.bindControls();
+        this.panel.bindGlobalControls(
+            (data) => this.panel.showInfoPanel(data),
+            () => this.runOptimization(),
+        );
+        this.panel.renderAlarms();
+        this.startDataLoop();
     }
 
     init() {
         this.sceneManager = new SceneManager('three-container');
-        this.spinningWheel = new SpinningWheel(this.sceneManager.scene);
-        this.sceneManager.setSpinningWheel(this.spinningWheel);
-        this.chartManager = new ChartManager();
+        this.frame3d = new SpinningFrame3D(this.sceneManager.scene);
+        this.sceneManager.setSpinningWheel(this.frame3d);
 
-        this.sceneManager.onComponentClick((data) => this.showInfoPanel(data));
+        this.panel = new EfficiencyPanelController({
+            sceneManager: this.sceneManager,
+            spinningFrame: this.frame3d,
+            chartManager: new ChartManager(),
+            apiClient: this.api,
+        });
 
+        this.sceneManager.onComponentClick((data) => this.panel.showInfoPanel(data));
         this.sceneManager.setWaterVisible(true);
-        this.spinningWheel.setYarnVisible(true);
+        this.frame3d.setYarnVisible(true);
 
-        this.updateDataDisplay();
-    }
+        this.panel.writeDataDisplay();
 
-    setupEventListeners() {
-        const speedControl = document.getElementById('speed-control');
-        const speedValue = document.getElementById('speed-value');
-
-        speedControl.addEventListener('input', (e) => {
-            const speed = parseInt(e.target.value);
-            speedValue.textContent = speed + ' rpm';
-            if (!this.useApi) {
-                this.sceneManager.setWheelSpeed(speed);
+        this.api.onData((data) => {
+            this.panel.currentData = data;
+            this.panel.writeApiData(data);
+            if (data.alarms) {
+                data.alarms.forEach(a => this.panel.pushAlarm(a));
             }
         });
 
-        const showYarn = document.getElementById('show-yarn');
-        showYarn.addEventListener('change', (e) => {
-            this.spinningWheel.setYarnVisible(e.target.checked);
-        });
-
-        const showWater = document.getElementById('show-water');
-        showWater.addEventListener('change', (e) => {
-            this.sceneManager.setWaterVisible(e.target.checked);
-        });
-
-        const useApi = document.getElementById('use-api');
-        useApi.addEventListener('change', (e) => {
-            this.useApi = e.target.checked;
-            if (this.useApi) {
-                this.connectToApi();
-            } else {
-                this.disconnectFromApi();
-            }
-        });
-
-        const apiUrl = document.getElementById('api-url');
-        apiUrl.addEventListener('change', (e) => {
-            this.apiClient.setBaseUrl(e.target.value);
-        });
-
-        const resetView = document.getElementById('reset-view');
-        resetView.addEventListener('click', () => {
-            this.sceneManager.resetCamera();
-        });
-
-        const toggleRotation = document.getElementById('toggle-rotation');
-        toggleRotation.addEventListener('click', () => {
-            const isRotating = this.sceneManager.toggleRotation();
-            const statusEl = document.getElementById('status');
-            if (isRotating) {
-                statusEl.textContent = this.useApi ? '运行中' : '模拟模式';
-                statusEl.className = 'data-value status-running';
-            } else {
-                statusEl.textContent = '已暂停';
-                statusEl.className = 'data-value status-stopped';
-            }
-        });
-
-        const closeInfo = document.getElementById('close-info');
-        closeInfo.addEventListener('click', () => {
-            this.hideInfoPanel();
-        });
-
-        const runOptimization = document.getElementById('run-optimization');
-        runOptimization.addEventListener('click', () => {
-            this.runOptimization();
-        });
-
-        this.setupWeightSliders();
-
-        this.apiClient.onData((data) => {
-            this.currentData = data;
-            this.updateFromApiData(data);
-        });
-
-        this.apiClient.onConnection((type, connected) => {
+        this.api.onConnection((type, connected) => {
             this.updateConnectionStatus(type, connected);
         });
-
-        this.startDataUpdateLoop();
     }
 
-    setupWeightSliders() {
-        const pairs = [
-            ['w-efficiency', 'w-eff-val'],
-            ['w-production', 'w-prod-val'],
-            ['w-twist', 'w-twist-val'],
-            ['w-breakage', 'w-break-val']
-        ];
-        pairs.forEach(([sid, vid]) => {
-            const slider = document.getElementById(sid);
-            const label = document.getElementById(vid);
-            if (slider && label) {
-                slider.addEventListener('input', (e) => {
-                    label.textContent = parseFloat(e.target.value).toFixed(2);
-                });
+    bindControls() {
+        // 顶层：use-api 切换、api-url 变更、panel 的 bindGlobalControls 已处理其他控件
+        const useApi = document.getElementById('use-api');
+        useApi.addEventListener('change', (e) => {
+            this.panel.useApi = e.target.checked;
+            if (this.panel.useApi) {
+                this.connectApi();
+            } else {
+                this.disconnectApi();
             }
         });
     }
 
-    async connectToApi() {
-        const apiUrl = document.getElementById('api-url').value;
-        this.apiClient.setBaseUrl(apiUrl);
-
+    async connectApi() {
+        const url = document.getElementById('api-url').value;
+        this.api.setBaseUrl(url);
         try {
-            await this.apiClient.checkHealth();
+            await this.api.checkHealth();
             document.getElementById('status').textContent = '连接中...';
-
             try {
-                await this.apiClient.connectWebSocket();
+                await this.api.connectWebSocket();
             } catch (e) {
-                console.warn('WebSocket连接失败，使用轮询模式');
+                console.warn('WebSocket 失败，使用轮询', e);
             }
-
-            const data = await this.apiClient.getData();
-            this.currentData = data;
-            this.updateFromApiData(data);
-
+            const data = await this.api.getData();
+            this.panel.currentData = data;
+            if (data && !data.status) this.panel.writeApiData(data);
             document.getElementById('status').textContent = '运行中';
         } catch (e) {
-            console.error('API连接失败:', e);
+            console.error('API 连接失败:', e);
             document.getElementById('use-api').checked = false;
-            this.useApi = false;
-            alert('无法连接到后端API，请确保服务已启动');
+            this.panel.useApi = false;
+            alert('无法连接到后端 API，请确保服务已启动');
         }
     }
 
-    disconnectFromApi() {
-        this.apiClient.disconnectWebSocket();
-        this.currentData = null;
+    disconnectApi() {
+        this.api.disconnectWebSocket();
+        this.panel.currentData = null;
         document.getElementById('status').textContent = '模拟模式';
     }
 
     updateConnectionStatus(type, connected) {
-        if (type === 'api') {
-            const el = document.getElementById('api-status');
-            el.textContent = connected ? 'API已连接' : 'API未连接';
-            el.className = 'status-indicator ' + (connected ? 'status-connected' : 'status-disconnected');
-        } else if (type === 'websocket') {
-            const el = document.getElementById('ws-status');
-            el.textContent = connected ? 'WebSocket已连接' : 'WebSocket未连接';
-            el.className = 'status-indicator ' + (connected ? 'status-connected' : 'status-disconnected');
-        }
+        const el = type === 'api'
+            ? document.getElementById('api-status')
+            : document.getElementById('ws-status');
+        if (!el) return;
+        const label = type === 'api' ? 'API' : 'WebSocket';
+        el.textContent = connected ? `${label}已连接` : `${label}未连接`;
+        el.className = 'status-indicator ' + (connected ? 'status-connected' : 'status-disconnected');
     }
 
-    updateFromApiData(data) {
-        const waterWheel = data.water_wheel || {};
-        const spindles = data.spindles || [];
-
-        const wheelRpm = waterWheel.rotational_speed || 0;
-        this.sceneManager.setWheelSpeed(Math.min(wheelRpm, 60));
-
-        const activeSpindles = spindles.filter(s => !s.broken);
-        const avgSpeed = activeSpindles.length > 0
-            ? activeSpindles.reduce((sum, s) => sum + s.speed, 0) / activeSpindles.length
-            : 0;
-        const avgTension = activeSpindles.length > 0
-            ? activeSpindles.reduce((sum, s) => sum + s.tension, 0) / activeSpindles.length
-            : 0;
-        const avgTwist = activeSpindles.length > 0
-            ? activeSpindles.reduce((sum, s) => sum + s.twist, 0) / activeSpindles.length
-            : 0;
-
-        document.getElementById('wheel-speed').textContent = wheelRpm.toFixed(1);
-        document.getElementById('spindle-speed').textContent = avgSpeed.toFixed(1);
-        document.getElementById('tension').textContent = avgTension.toFixed(2);
-        document.getElementById('twist').textContent = avgTwist.toFixed(1);
-        document.getElementById('power').textContent = (data.energy_efficiency ? avgSpeed * 0.05 : 0.5).toFixed(2);
-        document.getElementById('efficiency').textContent = (data.energy_efficiency || 0).toFixed(2);
-        document.getElementById('breakage-rate').textContent = (data.breakage_rate || 0).toFixed(1);
-
-        this.chartManager.addDataPoint(wheelRpm, avgTwist, this.elapsedTime);
-        this.updateEfficiencyChart(data);
-    }
-
-    updateEfficiencyChart(data) {
-        const efficiencyData = [
-            { label: '水轮效率', value: 85 },
-            { label: '传动效率', value: 92 },
-            { label: '纺纱效率', value: 78 },
-            { label: '综合能效', value: (data.energy_efficiency || 10) * 5 }
-        ];
-        this.chartManager.updateEfficiencyChart(efficiencyData);
-    }
-
-    startDataUpdateLoop() {
-        const updateLoop = (timestamp) => {
-            const delta = (timestamp - this.lastUpdateTime) / 1000;
-
-            if (delta >= this.updateInterval) {
-                this.elapsedTime += delta;
-                if (!this.useApi) {
-                    this.updateDataDisplay();
-                    this.updateCharts();
+    // rAF 数据更新：模拟模式本地计算，API 模式让 onData 回调触发
+    startDataLoop() {
+        const INTERVAL = 0.1;
+        const loop = (t) => {
+            const dt = (t - this.lastUpdateTime) / 1000;
+            if (dt >= INTERVAL) {
+                this.panel.elapsedTime += dt;
+                if (!this.panel.useApi) {
+                    this.panel.writeDataDisplay();
+                    this.panel.updateChartsLocal();
                 }
-                this.lastUpdateTime = timestamp;
+                this.lastUpdateTime = t;
             }
-
-            requestAnimationFrame(updateLoop);
+            requestAnimationFrame(loop);
         };
-
-        requestAnimationFrame(updateLoop);
-    }
-
-    updateDataDisplay() {
-        const wheelSpeed = this.sceneManager.wheelSpeed;
-        const spindleSpeed = this.spinningWheel.getSpindleSpeed(wheelSpeed);
-        const tension = this.spinningWheel.getTension(wheelSpeed);
-        const twist = this.spinningWheel.getTwist(wheelSpeed);
-        const power = this.spinningWheel.getPower(wheelSpeed);
-        const efficiency = wheelSpeed > 0 ? (wheelSpeed * 0.3) : 0;
-        const breakage = wheelSpeed > 40 ? (wheelSpeed - 40) * 0.2 : 0;
-
-        document.getElementById('wheel-speed').textContent = wheelSpeed.toFixed(1);
-        document.getElementById('spindle-speed').textContent = spindleSpeed.toFixed(1);
-        document.getElementById('tension').textContent = tension.toFixed(2);
-        document.getElementById('twist').textContent = twist.toFixed(1);
-        document.getElementById('power').textContent = power.toFixed(3);
-        document.getElementById('efficiency').textContent = efficiency.toFixed(2);
-        document.getElementById('breakage-rate').textContent = breakage.toFixed(1);
-    }
-
-    updateCharts() {
-        const wheelSpeed = this.sceneManager.wheelSpeed;
-        const twist = this.spinningWheel.getTwist(wheelSpeed);
-        this.chartManager.addDataPoint(wheelSpeed, twist, this.elapsedTime);
-
-        const efficiencyData = [
-            { label: '水轮效率', value: 85 },
-            { label: '传动效率', value: 92 },
-            { label: '纺纱效率', value: 78 },
-            { label: '综合能效', value: wheelSpeed * 1.2 }
-        ];
-        this.chartManager.updateEfficiencyChart(efficiencyData);
+        requestAnimationFrame(loop);
     }
 
     async runOptimization() {
         const btn = document.getElementById('run-optimization');
         btn.disabled = true;
         btn.textContent = '优化中...';
-
         try {
-            const params = {
-                water_speed: parseFloat(document.getElementById('opt-water-speed').value),
-                wheel_radius: 1.5,
-                gear_ratio: 8.0,
-                mechanical_efficiency: 0.85,
-                friction_coefficient: 0.05,
-                min_tension: parseFloat(document.getElementById('opt-min-tension').value),
-                max_tension: parseFloat(document.getElementById('opt-max-tension').value),
-                max_twist_cv: parseFloat(document.getElementById('opt-max-cv').value),
-                population_size: parseInt(document.getElementById('opt-population').value),
-                generations: parseInt(document.getElementById('opt-generations').value),
-                belt_friction_coeff: parseFloat(document.getElementById('opt-belt-friction').value),
-                wrap_angle_deg: parseFloat(document.getElementById('opt-wrap-angle').value),
-                initial_belt_tension: parseFloat(document.getElementById('opt-belt-tension').value),
-                weight_energy_efficiency: parseFloat(document.getElementById('w-efficiency').value),
-                weight_production: parseFloat(document.getElementById('w-production').value),
-                weight_twist_uniformity: parseFloat(document.getElementById('w-twist').value),
-                weight_low_breakage: parseFloat(document.getElementById('w-breakage').value)
-            };
-
-            let result;
-            if (this.useApi && this.apiClient.isApiConnected()) {
-                result = await this.apiClient.runOptimization(params);
-            } else {
-                result = this.simulateOptimization(params);
-            }
-
-            this.displayOptimizationResult(result);
+            const params = this.panel.buildOptimizationPayload();
+            const result = (this.panel.useApi && this.api.isApiConnected())
+                ? await this.api.runOptimization(params)
+                : this.panel.simulateOptimizationLocal(params);
+            this.panel.renderOptimizationResult(result);
         } catch (e) {
             console.error('优化失败:', e);
             alert('优化计算失败: ' + e.message);
@@ -304,191 +141,6 @@ class App {
             btn.disabled = false;
             btn.textContent = '运行优化';
         }
-    }
-
-    simulateOptimization(params) {
-        const history = [];
-        let best = 0;
-        for (let i = 0; i < params.generations; i++) {
-            const val = 5 + Math.random() * 3 + (i / params.generations) * 8;
-            if (val > best) best = val;
-            history.push(best);
-        }
-
-        const wSum = (params.weight_energy_efficiency + params.weight_production +
-            params.weight_twist_uniformity + params.weight_low_breakage) || 1;
-
-        return {
-            optimal_num_spindles: 42,
-            optimal_blade_angle: 48.5,
-            max_objective_value: best,
-            total_production_rate: 35.2,
-            energy_efficiency: 12.8,
-            twist_uniformity_cv: 3.2,
-            breakage_rate: 2.1,
-            convergence_history: history,
-            weights_used: {
-                energy_efficiency: params.weight_energy_efficiency / wSum,
-                production: params.weight_production / wSum,
-                twist_uniformity: params.weight_twist_uniformity / wSum,
-                low_breakage: params.weight_low_breakage / wSum
-            }
-        };
-    }
-
-    displayOptimizationResult(result) {
-        const resultDiv = document.getElementById('optimization-result');
-        resultDiv.classList.remove('hidden');
-
-        document.getElementById('opt-spindles').textContent = result.optimal_num_spindles + ' 个';
-        document.getElementById('opt-blade-angle').textContent = result.optimal_blade_angle.toFixed(1) + '°';
-        document.getElementById('opt-efficiency').textContent = result.energy_efficiency.toFixed(2) + ' m/min·kW';
-        document.getElementById('opt-production').textContent = result.total_production_rate.toFixed(2) + ' m/min';
-
-        this.renderWeightsUsed(result.weights_used || {});
-        this.renderConvergenceChart(result.convergence_history);
-    }
-
-    renderWeightsUsed(weights) {
-        const labels = {
-            energy_efficiency: '能效比',
-            production: '生产率',
-            twist_uniformity: '捻度均匀性',
-            low_breakage: '低断头率'
-        };
-        const container = document.getElementById('weights-display');
-        if (!container) return;
-        container.innerHTML = Object.entries(labels).map(([k, label]) => {
-            const val = weights[k] != null ? (weights[k]).toFixed(3) : '-';
-            return `<div class="w-row"><span class="w-label">${label}</span><span class="w-value">${val}</span></div>`;
-        }).join('');
-    }
-
-    renderConvergenceChart(history) {
-        const ctx = document.getElementById('convergence-chart').getContext('2d');
-
-        if (this.convergenceChart) {
-            this.convergenceChart.destroy();
-        }
-
-        this.convergenceChart = new Chart(ctx, {
-            type: 'line',
-            data: {
-                labels: history.map((_, i) => i),
-                datasets: [{
-                    label: '适应度值',
-                    data: history,
-                    borderColor: '#e94560',
-                    backgroundColor: 'rgba(233, 69, 96, 0.1)',
-                    fill: true,
-                    tension: 0.4,
-                    pointRadius: 0
-                }]
-            },
-            options: {
-                responsive: true,
-                maintainAspectRatio: false,
-                plugins: {
-                    legend: { display: false },
-                    title: {
-                        display: true,
-                        text: '收敛曲线',
-                        color: '#e0e0e0',
-                        font: { size: 12 }
-                    }
-                },
-                scales: {
-                    x: {
-                        ticks: { color: '#888' },
-                        grid: { color: 'rgba(255,255,255,0.1)' }
-                    },
-                    y: {
-                        ticks: { color: '#888' },
-                        grid: { color: 'rgba(255,255,255,0.1)' }
-                    }
-                }
-            }
-        });
-    }
-
-    showInfoPanel(data) {
-        const panel = document.getElementById('info-panel');
-        const title = document.getElementById('info-title');
-        const body = document.getElementById('info-body');
-
-        title.textContent = data.name || '部件信息';
-
-        let html = '';
-
-        if (data.description) {
-            html += `<p style="margin-bottom: 10px; color: #e0e0e0; line-height: 1.6;">${data.description}</p>`;
-        }
-
-        html += '<div style="border-top: 1px solid rgba(233, 69, 96, 0.3); padding-top: 10px;">';
-
-        const fields = {
-            'diameter': '直径',
-            'height': '高度',
-            'length': '长度',
-            'width': '宽度',
-            'weight': '重量',
-            'material': '材质',
-            'bladeCount': '叶片数',
-            'transmission': '传动方式',
-            'transmissionRatio': '传动比',
-            'speed': '转速',
-            'index': '编号'
-        };
-
-        for (const [key, label] of Object.entries(fields)) {
-            if (data[key]) {
-                html += `<p><span class="info-label">${label}：</span><span class="info-value">${data[key]}</span></p>`;
-            }
-        }
-
-        html += '</div>';
-
-        if (data.type === 'spindle') {
-            const wheelSpeed = this.sceneManager.wheelSpeed;
-            const spindleSpeed = this.spinningWheel.getSpindleSpeed(wheelSpeed) * (data.baseRotationSpeed || 1);
-            html += '<div style="border-top: 1px solid rgba(233, 69, 96, 0.3); padding-top: 10px; margin-top: 10px;">';
-            html += `<p><span class="info-label">当前转速：</span><span class="info-value">${spindleSpeed.toFixed(1)} rpm</span></p>`;
-            html += '</div>';
-        }
-
-        body.innerHTML = html;
-        panel.classList.remove('hidden');
-    }
-
-    hideInfoPanel() {
-        const panel = document.getElementById('info-panel');
-        panel.classList.add('hidden');
-    }
-
-    addAlarm(alarm) {
-        this.alarms.unshift(alarm);
-        if (this.alarms.length > 50) {
-            this.alarms = this.alarms.slice(0, 50);
-        }
-        this.renderAlarms();
-    }
-
-    renderAlarms() {
-        const list = document.getElementById('alarm-list');
-        if (this.alarms.length === 0) {
-            list.innerHTML = '<div class="alarm-empty">暂无告警</div>';
-            return;
-        }
-
-        list.innerHTML = this.alarms.map(alarm => `
-            <div class="alarm-item alarm-${alarm.severity || 'warning'}">
-                <div class="alarm-header">
-                    <span class="alarm-type">${alarm.alarm_type || '告警'}</span>
-                    <span class="alarm-time">${new Date(alarm.timestamp).toLocaleTimeString()}</span>
-                </div>
-                <div class="alarm-message">${alarm.message || ''}</div>
-            </div>
-        `).join('');
     }
 }
 
