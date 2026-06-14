@@ -248,7 +248,17 @@ class SceneManager {
         if (this.spinningWheel) {
             const intersects = this.raycaster.intersectObjects(this.spinningWheel.getClickableObjects(), true);
             if (intersects.length > 0) {
-                const clickedObject = this.findClickableParent(intersects[0].object);
+                const hit = intersects[0];
+
+                if (hit.object.isInstancedMesh && hit.object.userData && hit.object.userData.isSpindleInstanced) {
+                    const spindleInfo = this.spinningWheel.getSpindleInfo(hit.instanceId);
+                    if (spindleInfo) {
+                        this.onComponentClick(spindleInfo);
+                        return;
+                    }
+                }
+
+                const clickedObject = this.findClickableParent(hit.object);
                 if (clickedObject && clickedObject.userData && clickedObject.userData.type) {
                     this.onComponentClick(clickedObject.userData);
                 }
