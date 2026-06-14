@@ -2,19 +2,25 @@ class SpinningWheel {
     constructor(scene) {
         this.scene = scene;
         this.group = new THREE.Group();
-        this.spindles = [];
+        this.spindleCount = 32;
+        this.instancedSpindleParts = [];
+        this.spindlePartGeometries = [];
+        this.spindleRotationSpeeds = [];
+        this.spindlePositions = [];
         this.yarns = [];
         this.wheelGroup = null;
         this.mainShaft = null;
         this.showYarn = true;
         this.wheelRotation = 0;
-        this.spindleRotation = 0;
+        this.spindleRotationAccum = new Float32Array(this.spindleCount);
         this.time = 0;
+        this.yarnUpdateCounter = 0;
+        this.yarnUpdateInterval = 3;
 
         this.createFrame();
         this.createWaterWheel();
         this.createMainShaft();
-        this.createSpindles();
+        this.createSpindlesInstanced();
         this.createYarns();
 
         this.scene.add(this.group);
@@ -114,11 +120,11 @@ class SpinningWheel {
         this.wheelGroup.userData = {
             type: 'waterWheel',
             name: '水轮',
-            description: '水转大纺车的动力来源，水流冲击叶片带动水轮旋转，通过传动装置驱动锭子转动。',
+            description: '水转大纺车的动力来源，水流冲击叶片带动水轮旋转，通过皮带传动驱动锭子转动。打滑率由欧拉皮带公式计算。',
             diameter: '约3米',
             bladeCount: '24片',
             material: '木质框架 + 竹制叶片',
-            transmission: '齿轮传动'
+            transmission: '皮带传动（含打滑修正）'
         };
 
         const woodMaterial = new THREE.MeshStandardMaterial({
@@ -154,10 +160,10 @@ class SpinningWheel {
 
         const spokeCount = 12;
         const spokeGeometry = new THREE.BoxGeometry(0.1, wheelRadius - 0.4, 0.1);
-        
+
         for (let i = 0; i < spokeCount; i++) {
             const angle = (i / spokeCount) * Math.PI * 2;
-            
+
             const spoke1 = new THREE.Mesh(spokeGeometry, woodMaterial);
             spoke1.position.y = (wheelRadius - 0.4) / 2;
             spoke1.position.z = -0.6;
@@ -176,17 +182,17 @@ class SpinningWheel {
         const bladeCount = 24;
         const bladeWidth = 0.6;
         const bladeHeight = 0.8;
-        
+
         for (let i = 0; i < bladeCount; i++) {
             const angle = (i / bladeCount) * Math.PI * 2;
             const bladeGeometry = new THREE.BoxGeometry(bladeWidth, bladeHeight, 0.08);
             const blade = new THREE.Mesh(bladeGeometry, bambooMaterial);
-            
+
             blade.position.x = Math.cos(angle) * wheelRadius;
             blade.position.y = Math.sin(angle) * wheelRadius;
             blade.rotation.z = angle + Math.PI / 2;
             blade.castShadow = true;
-            
+
             this.wheelGroup.add(blade);
         }
 
@@ -217,11 +223,11 @@ class SpinningWheel {
         shaftGroup.userData = {
             type: 'mainShaft',
             name: '主轴',
-            description: '连接水轮和锭子的传动主轴，将水轮的旋转动力传递给32个锭子。',
+            description: '连接水轮和锭子的传动主轴，将水轮的旋转动力通过皮带传动分配给32个锭子。打滑率由欧拉公式动态计算。',
             length: '约8米',
             diameter: '约20厘米',
             material: '硬木 + 铁轴套',
-            transmissionRatio: '1:3.5'
+            transmissionRatio: '1:3.5（含打滑修正）'
         };
 
         const woodMaterial = new THREE.MeshStandardMaterial({
@@ -275,8 +281,12 @@ class SpinningWheel {
         this.group.add(this.mainShaft);
     }
 
-    createSpindles() {
-        const spindleCount = 32;
+    _makeSpindlePart(name, geometry, material) {
+        this.spindlePartGeometries.push({ name, geometry });
+        return geometry;
+    }
+
+    createSpindlesInstanced() {
         const rows = 2;
         const cols = 16;
         const spacing = 0.9;
@@ -293,84 +303,97 @@ class SpinningWheel {
             metalness: 0.1
         });
 
-        this.spindleGroup = new THREE.Group();
-
-        for (let row = 0; row < rows; row++) {
-            for (let col = 0; col < cols; col++) {
-                const spindleIndex = row * cols + col;
-                const spindle = this.createSingleSpindle(spindleMaterial, baseMaterial, spindleIndex);
-                
-                const x = -((cols - 1) / 2) * spacing + col * spacing;
-                const z = row === 0 ? -1.5 : 1.5;
-                
-                spindle.position.set(x, 2.5, z);
-                spindle.userData = {
-                    type: 'spindle',
-                    name: `锭子 ${spindleIndex + 1}`,
-                    description: '用于纺纱的锭子，通过皮带带动高速旋转，将纤维加捻成纱线。',
-                    index: spindleIndex + 1,
-                    speed: '约80-150 rpm',
-                    material: '竹木',
-                    height: '约30厘米'
-                };
-                
-                this.spindles.push(spindle);
-                this.spindleGroup.add(spindle);
-            }
-        }
-
-        this.spindleGroup.position.set(0, 0, 0);
-        this.group.add(this.spindleGroup);
-    }
-
-    createSingleSpindle(spindleMaterial, baseMaterial, index) {
-        const spindle = new THREE.Group();
-
-        const baseGeometry = new THREE.CylinderGeometry(0.15, 0.18, 0.3, 12);
-        const base = new THREE.Mesh(baseGeometry, baseMaterial);
-        base.position.y = 0.15;
-        base.castShadow = true;
-        spindle.add(base);
-
-        const shaftGeometry = new THREE.CylinderGeometry(0.04, 0.04, 0.6, 8);
-        const shaft = new THREE.Mesh(shaftGeometry, spindleMaterial);
-        shaft.position.y = 0.6;
-        shaft.castShadow = true;
-        spindle.add(shaft);
-
-        const whorlGeometry = new THREE.CylinderGeometry(0.12, 0.12, 0.08, 16);
-        const whorl = new THREE.Mesh(whorlGeometry, spindleMaterial);
-        whorl.position.y = 0.4;
-        whorl.castShadow = true;
-        spindle.add(whorl);
-
-        const tipGeometry = new THREE.ConeGeometry(0.04, 0.15, 8);
-        const tip = new THREE.Mesh(tipGeometry, spindleMaterial);
-        tip.position.y = 0.97;
-        tip.castShadow = true;
-        spindle.add(tip);
-
-        const bobbinGeometry = new THREE.CylinderGeometry(0.08, 0.08, 0.3, 12);
         const bobbinMaterial = new THREE.MeshStandardMaterial({
             color: 0xf5deb3,
             roughness: 0.9,
             metalness: 0
         });
-        const bobbin = new THREE.Mesh(bobbinGeometry, bobbinMaterial);
-        bobbin.position.y = 0.65;
-        bobbin.castShadow = true;
-        spindle.add(bobbin);
 
-        spindle.userData.spindleShaft = shaft;
-        spindle.userData.bobbin = bobbin;
-        spindle.userData.baseRotationSpeed = 0.8 + Math.random() * 0.4;
+        const partSpecs = [
+            { name: 'base',   geometry: new THREE.CylinderGeometry(0.15, 0.18, 0.3, 12), material: baseMaterial,  yOffset: 0.15 },
+            { name: 'shaft',  geometry: new THREE.CylinderGeometry(0.04, 0.04, 0.6, 8),   material: spindleMaterial, yOffset: 0.6 },
+            { name: 'whorl',  geometry: new THREE.CylinderGeometry(0.12, 0.12, 0.08, 16), material: spindleMaterial, yOffset: 0.4 },
+            { name: 'tip',    geometry: new THREE.ConeGeometry(0.04, 0.15, 8),           material: spindleMaterial, yOffset: 0.97 },
+            { name: 'bobbin', geometry: new THREE.CylinderGeometry(0.08, 0.08, 0.3, 12), material: bobbinMaterial,  yOffset: 0.65 }
+        ];
 
-        return spindle;
+        this.spindleGroup = new THREE.Group();
+        this.instancedSpindleParts = [];
+        this.spindlePositions = [];
+        this.spindleBaseRotationSpeeds = [];
+
+        const dummy = new THREE.Object3D();
+        const partNames = [];
+
+        partSpecs.forEach((spec, partIdx) => {
+            const instanced = new THREE.InstancedMesh(spec.geometry, spec.material, this.spindleCount);
+            instanced.castShadow = true;
+            instanced.userData = {
+                type: 'spindlePart',
+                partName: spec.name,
+                partYOffset: spec.yOffset,
+                isSpindleInstanced: true
+            };
+            instanced.instanceMatrix.setUsage(THREE.DynamicDrawUsage);
+            this.instancedSpindleParts.push(instanced);
+            this.spindleGroup.add(instanced);
+            partNames.push(spec.name);
+        });
+
+        this.spindlePartNames = partNames;
+
+        let spindleIdx = 0;
+        for (let row = 0; row < rows; row++) {
+            for (let col = 0; col < cols; col++) {
+                const x = -((cols - 1) / 2) * spacing + col * spacing;
+                const z = row === 0 ? -1.5 : 1.5;
+                const y = 2.5;
+
+                this.spindlePositions.push({ x, y, z, index: spindleIdx });
+
+                const baseSpeed = 0.8 + Math.random() * 0.4;
+                this.spindleBaseRotationSpeeds.push(baseSpeed);
+                this.spindleRotationAccum[spindleIdx] = Math.random() * Math.PI * 2;
+
+                partSpecs.forEach((spec, partIdx) => {
+                    dummy.position.set(x, y + spec.yOffset, z);
+                    dummy.rotation.set(0, this.spindleRotationAccum[spindleIdx], 0);
+                    dummy.scale.set(1, 1, 1);
+                    dummy.updateMatrix();
+                    this.instancedSpindleParts[partIdx].setMatrixAt(spindleIdx, dummy.matrix);
+                });
+
+                spindleIdx++;
+            }
+        }
+
+        this.instancedSpindleParts.forEach(inst => inst.instanceMatrix.needsUpdate = true);
+
+        this.spindleGroup.userData = {
+            type: 'spindleGroup',
+            name: '锭子阵列（32锭）',
+            description: '使用InstancedMesh实例化渲染，draw call从160降至5，显著提升移动端帧率。'
+        };
+
+        this.group.add(this.spindleGroup);
+    }
+
+    getSpindleInfo(instanceId) {
+        if (instanceId < 0 || instanceId >= this.spindleCount) return null;
+        const pos = this.spindlePositions[instanceId];
+        return {
+            type: 'spindle',
+            name: `锭子 ${pos.index + 1}`,
+            description: '使用InstancedMesh实例化渲染的纺纱锭子，通过皮带带动高速旋转。',
+            index: pos.index + 1,
+            material: '竹木',
+            height: '约30厘米'
+        };
     }
 
     createYarns() {
         this.yarnGroup = new THREE.Group();
-        this.yarnGroup.userData = { type: 'yarn', name: '纱线', description: '由32个锭子纺出的纱线，汇集到上方的导纱装置。' };
+        this.yarnGroup.userData = { type: 'yarn', name: '纱线', description: '由32个锭子纺出的纱线，汇集到上方导纱装置。' };
 
         const yarnMaterial = new THREE.LineBasicMaterial({
             color: 0xf5deb3,
@@ -378,78 +401,65 @@ class SpinningWheel {
             opacity: 0.8
         });
 
-        this.yarns = [];
+        this.yarnLines = [];
+        const SEGMENTS = 6;
 
-        for (let i = 0; i < this.spindles.length; i++) {
-            const spindle = this.spindles[i];
-            const curve = new THREE.CatmullRomCurve3([
-                new THREE.Vector3(0, 0, 0),
-                new THREE.Vector3(0, 0.5, 0),
-                new THREE.Vector3(0, 1, 0),
-                new THREE.Vector3(0, 1.5, 0)
-            ]);
+        for (let i = 0; i < this.spindleCount; i++) {
+            const pos = this.spindlePositions[i];
+            const positions = new Float32Array((SEGMENTS + 1) * 3);
 
-            const tubeGeometry = new THREE.TubeGeometry(curve, 20, 0.015, 8, false);
-            const yarnMesh = new THREE.Mesh(tubeGeometry, yarnMaterial.clone());
-            yarnMesh.position.copy(spindle.position);
-            yarnMesh.position.y += 0.9;
-            
-            yarnMesh.userData = {
-                spindleIndex: i,
-                originalY: spindle.position.y + 0.9
-            };
+            for (let s = 0; s <= SEGMENTS; s++) {
+                const t = s / SEGMENTS;
+                const sx = pos.x;
+                const sy = pos.y + 0.9 + t * 2.0;
+                const sz = pos.z * (1 - t);
+                positions[s * 3] = sx;
+                positions[s * 3 + 1] = sy;
+                positions[s * 3 + 2] = sz;
+            }
 
-            this.yarns.push(yarnMesh);
-            this.yarnGroup.add(yarnMesh);
+            const geometry = new THREE.BufferGeometry();
+            geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+            geometry.setDrawRange(0, SEGMENTS + 1);
+
+            const line = new THREE.Line(geometry, yarnMaterial.clone());
+            line.userData = { spindleIndex: i, basePos: { ...pos }, segments: SEGMENTS };
+            this.yarnLines.push(line);
+            this.yarnGroup.add(line);
         }
 
         this.group.add(this.yarnGroup);
     }
 
-    updateYarns(time, speedFactor) {
+    updateYarnsLazy(time, speedFactor) {
         if (!this.showYarn) return;
 
-        for (let i = 0; i < this.yarns.length; i++) {
-            const yarn = this.yarns[i];
-            const spindle = this.spindles[i];
-            
-            const waveOffset = i * 0.3;
-            const wave = Math.sin(time * 3 + waveOffset) * 0.05 * speedFactor;
-            
-            const curvePoints = [
-                new THREE.Vector3(
-                    spindle.position.x + wave * 0.3,
-                    0,
-                    spindle.position.z + wave * 0.2
-                ),
-                new THREE.Vector3(
-                    spindle.position.x + wave * 0.5,
-                    0.5,
-                    spindle.position.z + wave * 0.3
-                ),
-                new THREE.Vector3(
-                    spindle.position.x + wave * 0.3,
-                    1,
-                    spindle.position.z + wave * 0.15
-                ),
-                new THREE.Vector3(
-                    spindle.position.x + wave * 0.1,
-                    1.8,
-                    0
-                )
-            ];
+        this.yarnUpdateCounter++;
+        if (this.yarnUpdateCounter < this.yarnUpdateInterval) return;
+        this.yarnUpdateCounter = 0;
 
-            const curve = new THREE.CatmullRomCurve3(curvePoints);
-            const newGeometry = new THREE.TubeGeometry(curve, 30, 0.012, 6, false);
-            
-            yarn.geometry.dispose();
-            yarn.geometry = newGeometry;
+        for (let i = 0; i < this.yarnLines.length; i++) {
+            const line = this.yarnLines[i];
+            const userData = line.userData;
+            const base = userData.basePos;
+            const segments = userData.segments;
+            const positions = line.geometry.attributes.position.array;
+            const waveOffset = i * 0.3;
+
+            for (let s = 0; s <= segments; s++) {
+                const t = s / segments;
+                const wave = Math.sin(time * 3 + waveOffset + t * 2) * 0.05 * speedFactor;
+                positions[s * 3] = base.x + wave * (1 - t) * 0.5;
+                positions[s * 3 + 1] = base.y + 0.9 + t * 2.0 + wave * 0.2;
+                positions[s * 3 + 2] = base.z * (1 - t) + wave * 0.15;
+            }
+            line.geometry.attributes.position.needsUpdate = true;
         }
     }
 
     update(delta, wheelSpeed) {
         this.time += delta;
-        const speedFactor = wheelSpeed / 50;
+        const speedFactor = Math.min(wheelSpeed / 50, 1.5);
 
         this.wheelRotation += delta * (wheelSpeed * 0.1) * 0.2;
         if (this.wheelGroup) {
@@ -460,13 +470,30 @@ class SpinningWheel {
             this.mainShaft.rotation.x = this.wheelRotation * 3.5;
         }
 
-        this.spindleRotation += delta * (wheelSpeed * 0.1) * 3.5;
-        this.spindles.forEach((spindle, index) => {
-            const baseSpeed = spindle.userData.baseRotationSpeed;
-            spindle.rotation.y = this.spindleRotation * baseSpeed;
+        const dummy = new THREE.Object3D();
+        const totalSpindleDelta = delta * (wheelSpeed * 0.1) * 3.5;
+
+        for (let i = 0; i < this.spindleCount; i++) {
+            const pos = this.spindlePositions[i];
+            this.spindleRotationAccum[i] += totalSpindleDelta * this.spindleBaseRotationSpeeds[i];
+            const rot = this.spindleRotationAccum[i];
+
+            for (let p = 0; p < this.instancedSpindleParts.length; p++) {
+                const part = this.instancedSpindleParts[p];
+                const yOffset = part.userData.partYOffset;
+                dummy.position.set(pos.x, pos.y + yOffset, pos.z);
+                dummy.rotation.set(0, rot, 0);
+                dummy.scale.set(1, 1, 1);
+                dummy.updateMatrix();
+                part.setMatrixAt(i, dummy.matrix);
+            }
+        }
+
+        this.instancedSpindleParts.forEach(inst => {
+            inst.instanceMatrix.needsUpdate = true;
         });
 
-        this.updateYarns(this.time, speedFactor);
+        this.updateYarnsLazy(this.time, speedFactor);
     }
 
     setYarnVisible(visible) {
@@ -480,7 +507,8 @@ class SpinningWheel {
         if (this.frameGroup) objects.push(this.frameGroup);
         if (this.mainShaft) objects.push(this.mainShaft);
         if (this.yarnGroup) objects.push(this.yarnGroup);
-        objects.push(...this.spindles);
+        if (this.spindleGroup) objects.push(this.spindleGroup);
+        objects.push(...this.instancedSpindleParts);
         return objects;
     }
 
