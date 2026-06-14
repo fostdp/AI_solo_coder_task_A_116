@@ -1,4 +1,5 @@
 import os
+import math
 import asyncio
 import json
 from typing import List, Optional
@@ -81,7 +82,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="古代水转大纺车动力学仿真与能效分析系统",
     description="基于FastAPI的水转大纺车动力学仿真、能效优化与实时监测系统",
-    version="1.0.0",
+    version="1.1.0",
     lifespan=lifespan
 )
 
@@ -119,6 +120,9 @@ def collect_and_process_data() -> dict:
         mechanical_efficiency = 0.85
         num_spindles = 32
         friction_coefficient = 0.05
+        belt_friction_coeff = 0.35
+        wrap_angle = math.pi
+        initial_belt_tension = 200.0
 
         sim_result = simulator.simulate(
             water_speed=water_speed,
@@ -127,7 +131,10 @@ def collect_and_process_data() -> dict:
             gear_ratio=gear_ratio,
             mechanical_efficiency=mechanical_efficiency,
             num_spindles=num_spindles,
-            friction_coefficient=friction_coefficient
+            friction_coefficient=friction_coefficient,
+            belt_friction_coeff=belt_friction_coeff,
+            wrap_angle=wrap_angle,
+            initial_belt_tension=initial_belt_tension
         )
     else:
         sim_result = modbus_data
@@ -154,8 +161,13 @@ def collect_and_process_data() -> dict:
 async def root():
     return {
         "name": "古代水转大纺车动力学仿真与能效分析系统",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "status": "running",
+        "changes": [
+            "v1.1.0: 引入欧拉皮带打滑公式修正传动扭矩/转速",
+            "v1.1.0: 遗传算法支持4目标交互式权重调整",
+            "v1.1.0: 前端锭子改用InstancedMesh实例化渲染"
+        ],
         "endpoints": {
             "realtime_data": "/api/data",
             "dynamics_simulation": "/api/dynamics",
@@ -198,6 +210,7 @@ async def get_realtime_data(
 @app.post("/api/dynamics", response_model=DynamicsResponse)
 async def run_dynamics_simulation(request: DynamicsRequest):
     try:
+        wrap_angle = math.radians(request.wrap_angle_deg)
         result = simulator.simulate(
             water_speed=request.water_speed,
             blade_angle=request.blade_angle,
@@ -205,7 +218,10 @@ async def run_dynamics_simulation(request: DynamicsRequest):
             gear_ratio=request.gear_ratio,
             mechanical_efficiency=request.mechanical_efficiency,
             num_spindles=request.num_spindles,
-            friction_coefficient=request.friction_coefficient
+            friction_coefficient=request.friction_coefficient,
+            belt_friction_coeff=request.belt_friction_coeff,
+            wrap_angle=wrap_angle,
+            initial_belt_tension=request.initial_belt_tension
         )
         return result
     except Exception as e:
@@ -225,7 +241,14 @@ async def run_optimization(request: OptimizationRequest):
             max_tension=request.max_tension,
             max_twist_cv=request.max_twist_cv,
             population_size=request.population_size,
-            generations=request.generations
+            generations=request.generations,
+            belt_friction_coeff=request.belt_friction_coeff,
+            wrap_angle_deg=request.wrap_angle_deg,
+            initial_belt_tension=request.initial_belt_tension,
+            weight_energy_efficiency=request.weight_energy_efficiency,
+            weight_production=request.weight_production,
+            weight_twist_uniformity=request.weight_twist_uniformity,
+            weight_low_breakage=request.weight_low_breakage
         )
         return result
     except Exception as e:
