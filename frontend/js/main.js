@@ -95,6 +95,8 @@ class App {
             this.runOptimization();
         });
 
+        this.setupWeightSliders();
+
         this.apiClient.onData((data) => {
             this.currentData = data;
             this.updateFromApiData(data);
@@ -105,6 +107,24 @@ class App {
         });
 
         this.startDataUpdateLoop();
+    }
+
+    setupWeightSliders() {
+        const pairs = [
+            ['w-efficiency', 'w-eff-val'],
+            ['w-production', 'w-prod-val'],
+            ['w-twist', 'w-twist-val'],
+            ['w-breakage', 'w-break-val']
+        ];
+        pairs.forEach(([sid, vid]) => {
+            const slider = document.getElementById(sid);
+            const label = document.getElementById(vid);
+            if (slider && label) {
+                slider.addEventListener('input', (e) => {
+                    label.textContent = parseFloat(e.target.value).toFixed(2);
+                });
+            }
+        });
     }
 
     async connectToApi() {
@@ -259,7 +279,14 @@ class App {
                 max_tension: parseFloat(document.getElementById('opt-max-tension').value),
                 max_twist_cv: parseFloat(document.getElementById('opt-max-cv').value),
                 population_size: parseInt(document.getElementById('opt-population').value),
-                generations: parseInt(document.getElementById('opt-generations').value)
+                generations: parseInt(document.getElementById('opt-generations').value),
+                belt_friction_coeff: parseFloat(document.getElementById('opt-belt-friction').value),
+                wrap_angle_deg: parseFloat(document.getElementById('opt-wrap-angle').value),
+                initial_belt_tension: parseFloat(document.getElementById('opt-belt-tension').value),
+                weight_energy_efficiency: parseFloat(document.getElementById('w-efficiency').value),
+                weight_production: parseFloat(document.getElementById('w-production').value),
+                weight_twist_uniformity: parseFloat(document.getElementById('w-twist').value),
+                weight_low_breakage: parseFloat(document.getElementById('w-breakage').value)
             };
 
             let result;
@@ -288,6 +315,9 @@ class App {
             history.push(best);
         }
 
+        const wSum = (params.weight_energy_efficiency + params.weight_production +
+            params.weight_twist_uniformity + params.weight_low_breakage) || 1;
+
         return {
             optimal_num_spindles: 42,
             optimal_blade_angle: 48.5,
@@ -296,7 +326,13 @@ class App {
             energy_efficiency: 12.8,
             twist_uniformity_cv: 3.2,
             breakage_rate: 2.1,
-            convergence_history: history
+            convergence_history: history,
+            weights_used: {
+                energy_efficiency: params.weight_energy_efficiency / wSum,
+                production: params.weight_production / wSum,
+                twist_uniformity: params.weight_twist_uniformity / wSum,
+                low_breakage: params.weight_low_breakage / wSum
+            }
         };
     }
 
@@ -309,7 +345,23 @@ class App {
         document.getElementById('opt-efficiency').textContent = result.energy_efficiency.toFixed(2) + ' m/min·kW';
         document.getElementById('opt-production').textContent = result.total_production_rate.toFixed(2) + ' m/min';
 
+        this.renderWeightsUsed(result.weights_used || {});
         this.renderConvergenceChart(result.convergence_history);
+    }
+
+    renderWeightsUsed(weights) {
+        const labels = {
+            energy_efficiency: '能效比',
+            production: '生产率',
+            twist_uniformity: '捻度均匀性',
+            low_breakage: '低断头率'
+        };
+        const container = document.getElementById('weights-display');
+        if (!container) return;
+        container.innerHTML = Object.entries(labels).map(([k, label]) => {
+            const val = weights[k] != null ? (weights[k]).toFixed(3) : '-';
+            return `<div class="w-row"><span class="w-label">${label}</span><span class="w-value">${val}</span></div>`;
+        }).join('');
     }
 
     renderConvergenceChart(history) {
