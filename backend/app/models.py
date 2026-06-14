@@ -26,6 +26,10 @@ class TransmissionData(BaseModel):
     output_torque: float = Field(description="输出扭矩 (N·m)")
     input_speed: float = Field(description="输入转速 (rpm)")
     output_speed: float = Field(description="输出转速 (rpm)")
+    slip_rate: Optional[float] = Field(None, description="皮带打滑率 (0-1)")
+    critical_torque: Optional[float] = Field(None, description="临界打滑扭矩 (N·m)")
+    belt_friction_coeff: Optional[float] = Field(None, description="皮带摩擦系数")
+    wrap_angle_deg: Optional[float] = Field(None, description="包角 (度)")
 
 
 class SpinningWheelData(BaseModel):
@@ -46,7 +50,10 @@ class DynamicsRequest(BaseModel):
     gear_ratio: float = Field(gt=0, description="传动比")
     mechanical_efficiency: float = Field(gt=0, le=1, description="机械效率")
     num_spindles: int = Field(ge=16, le=64, description="锭子数量")
-    friction_coefficient: float = Field(ge=0, description="摩擦系数")
+    friction_coefficient: float = Field(ge=0, description="锭子摩擦系数")
+    belt_friction_coeff: float = Field(default=0.35, ge=0.05, le=0.9, description="皮带-轮摩擦系数 (μ)")
+    wrap_angle_deg: float = Field(default=180.0, ge=90.0, le=270.0, description="皮带包角 (度)")
+    initial_belt_tension: float = Field(default=200.0, ge=50.0, le=1000.0, description="皮带初始张力 (N)")
 
 
 class DynamicsResponse(BaseModel):
@@ -66,12 +73,19 @@ class OptimizationRequest(BaseModel):
     wheel_radius: float = Field(gt=0, description="水轮半径 (m)")
     gear_ratio: float = Field(gt=0, description="传动比")
     mechanical_efficiency: float = Field(gt=0, le=1, description="机械效率")
-    friction_coefficient: float = Field(ge=0, description="摩擦系数")
+    friction_coefficient: float = Field(ge=0, description="锭子摩擦系数")
     min_tension: float = Field(gt=0, description="最小纱线张力 (N)")
     max_tension: float = Field(gt=0, description="最大纱线张力 (N)")
     max_twist_cv: float = Field(gt=0, description="最大捻度变异系数")
     population_size: int = Field(default=50, ge=10, description="遗传算法种群大小")
     generations: int = Field(default=100, ge=10, description="遗传算法迭代代数")
+    belt_friction_coeff: float = Field(default=0.35, ge=0.05, le=0.9, description="皮带摩擦系数")
+    wrap_angle_deg: float = Field(default=180.0, ge=90.0, le=270.0, description="皮带包角 (度)")
+    initial_belt_tension: float = Field(default=200.0, ge=50.0, le=1000.0, description="皮带初始张力 (N)")
+    weight_energy_efficiency: float = Field(default=0.7, ge=0.0, le=1.0, description="能效目标权重")
+    weight_production: float = Field(default=0.3, ge=0.0, le=1.0, description="生产率目标权重")
+    weight_twist_uniformity: float = Field(default=0.0, ge=0.0, le=1.0, description="捻度均匀性目标权重")
+    weight_low_breakage: float = Field(default=0.0, ge=0.0, le=1.0, description="低断头率目标权重")
 
 
 class OptimizationResult(BaseModel):
@@ -83,6 +97,7 @@ class OptimizationResult(BaseModel):
     twist_uniformity_cv: float
     breakage_rate: float
     convergence_history: List[float]
+    weights_used: dict = Field(description="实际使用的归一化权重")
 
 
 class AlarmData(BaseModel):
