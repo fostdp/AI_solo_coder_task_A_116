@@ -1,321 +1,342 @@
+"""
+FastAPI API 网关（重构版 v1.2.0）
+
+本模块只负责：
+  1. 接收前端 HTTP 与 WebSocket 请求
+  2. 通过 Redis Pub/Sub 与 4 个微服务通信
+  3. 聚合结果返回前端 / 通过 WS 广播
+  4. InfluxDB 历史数据查询
+
+不再直接包含：
+  - Modbus 采集   → modbus_receiver 服务
+  - 动力学仿真   → dynamics_simulator 服务
+  - 遗传算法优化 → efficiency_optimizer 服务
+  - 告警/MQTT    → alarm_mqtt 服务
+"""
+
 import os
-import math
-import asyncio
+import sys
 import json
+import asyncio
 from typing import List, Optional
 from datetime import datetime
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Query
 from fastapi.middleware.cors import CORSMiddleware
-from dotenv import load_dotenv
 
-from .models import (
+_BACKEND_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _BACKEND_ROOT not in sys.path:
+    sys.path.insert(0, _BACKEND_ROOT)
+
+from app.models import (
     DynamicsRequest, DynamicsResponse, OptimizationRequest,
     OptimizationResult, AlarmData
 )
-from .database import db_manager
-from .modbus_client import modbus_client
-from .dynamics import simulator
-from .optimization import optimizer
-from .alarm import alarm_manager
+from app.database import db_manager
+from shared.bus import MessageBus
+from shared.config_loader import get_config, load_config
 
-load_dotenv()
+CFG = load_config()
+API_CFG = get_config("api_gateway", default={}) or {}
+RESPONSE_TIMEOUT = float(API_CFG.get("response_timeout", 30.0))
+
+bus = MessageBus.instance()
 
 
+# ============================================================
+# WebSocket 连接管理
+# ============================================================
 class ConnectionManager:
     def __init__(self):
         self.active_connections: List[WebSocket] = []
 
-    async def connect(self, websocket: WebSocket):
-        await websocket.accept()
-        self.active_connections.append(websocket)
+    async def connect(self, ws: WebSocket):
+        await ws.accept()
+        self.active_connections.append(ws)
 
-    def disconnect(self, websocket: WebSocket):
-        if websocket in self.active_connections:
-            self.active_connections.remove(websocket)
+    def disconnect(self, ws: WebSocket):
+        if ws in self.active_connections:
+            self.active_connections.remove(ws)
 
     async def broadcast(self, message: dict):
-        for connection in list(self.active_connections):
+        for conn in list(self.active_connections):
             try:
-                await connection.send_json(message)
+                await conn.send_json(message)
             except Exception:
                 pass
 
 
-manager = ConnectionManager()
-latest_data = None
-collection_task = None
+ws_manager = ConnectionManager()
+latest_data: Optional[dict] = None
+latest_alarms: List[dict] = []
+_event_loop_ref: Optional[asyncio.AbstractEventLoop] = None
 
 
+def _async_broadcast(message: dict):
+    """从 Redis 订阅回调线程把广播送到 asyncio 循环里。"""
+    if _event_loop_ref is None:
+        return
+    try:
+        asyncio.run_coroutine_threadsafe(ws_manager.broadcast(message), _event_loop_ref)
+    except Exception:
+        pass
+
+
+# ============================================================
+# Redis 事件 → 网关状态同步
+# ============================================================
+def _on_simulation_result(envelope: dict):
+    global latest_data
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return
+    latest_data = payload
+    # 写入 InfluxDB（兼容旧逻辑，在网关层完成）
+    try:
+        db_manager.write_spinning_wheel_data(payload)
+    except Exception as e:
+        print(f"[APIGateway] InfluxDB 写入失败: {e}")
+    _async_broadcast({"type": "data", "data": payload})
+
+
+def _on_alarm_event(envelope: dict):
+    payload = envelope.get("payload")
+    if not isinstance(payload, dict):
+        return
+    latest_alarms.append(payload)
+    if len(latest_alarms) > 200:
+        latest_alarms[:] = latest_alarms[-200:]
+    try:
+        db_manager.write_alarm(payload)
+    except Exception as e:
+        print(f"[APIGateway] 告警入库失败: {e}")
+    _async_broadcast({"type": "alarm", "data": payload})
+
+
+# ============================================================
+# 启动 / 关闭
+# ============================================================
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global collection_task
+    global _event_loop_ref
+    _event_loop_ref = asyncio.get_running_loop()
+
     try:
         db_manager.connect()
-        print("Database connected")
+        print("[APIGateway] InfluxDB connected")
     except Exception as e:
-        print(f"Database connection failed: {e}")
+        print(f"[APIGateway] InfluxDB 连接失败(忽略): {e}")
 
     try:
-        alarm_manager.connect_mqtt()
-        print("MQTT connected")
+        bus.subscribe("simulation_result", _on_simulation_result)
+        bus.subscribe("alarm_event", _on_alarm_event)
+        print(f"[APIGateway] Redis 订阅已就绪 connected={bus.ping()}")
     except Exception as e:
-        print(f"MQTT connection failed: {e}")
-
-    collection_task = asyncio.create_task(data_collection_loop())
+        print(f"[APIGateway] Redis 订阅失败: {e}")
 
     yield
 
-    if collection_task:
-        collection_task.cancel()
-        try:
-            await collection_task
-        except asyncio.CancelledError:
-            pass
-
-    db_manager.close()
-    alarm_manager.disconnect_mqtt()
-    print("Shutdown complete")
+    try:
+        db_manager.close()
+    except Exception:
+        pass
+    try:
+        bus.close()
+    except Exception:
+        pass
+    print("[APIGateway] Shutdown complete")
 
 
 app = FastAPI(
-    title="古代水转大纺车动力学仿真与能效分析系统",
-    description="基于FastAPI的水转大纺车动力学仿真、能效优化与实时监测系统",
-    version="1.1.0",
-    lifespan=lifespan
+    title="水转大纺车 API 网关",
+    description="基于 FastAPI + Redis Pub/Sub 的微服务网关，动力学/优化/告警均委托微服务处理",
+    version=CFG.get("version", "1.2.0"),
+    lifespan=lifespan,
 )
 
+_cors = API_CFG.get("cors_origins", ["*"])
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=_cors if isinstance(_cors, list) else ["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
-async def data_collection_loop():
-    global latest_data
-    interval = float(os.getenv("COLLECTION_INTERVAL", "5"))
-    while True:
-        try:
-            data = collect_and_process_data()
-            if data:
-                latest_data = data
-                await manager.broadcast({"type": "data", "data": data})
-        except Exception as e:
-            print(f"Data collection error: {e}")
-        await asyncio.sleep(interval)
-
-
-def collect_and_process_data() -> dict:
-    modbus_data = modbus_client.read_all_data()
-
-    if not modbus_data.get("water_wheel") or modbus_data["water_wheel"].get("water_speed", 0) == 0:
-        water_speed = 2.5
-        blade_angle = 45.0
-        wheel_radius = 1.5
-        gear_ratio = 8.0
-        mechanical_efficiency = 0.85
-        num_spindles = 32
-        friction_coefficient = 0.05
-        belt_friction_coeff = 0.35
-        wrap_angle = math.pi
-        initial_belt_tension = 200.0
-
-        sim_result = simulator.simulate(
-            water_speed=water_speed,
-            blade_angle=blade_angle,
-            wheel_radius=wheel_radius,
-            gear_ratio=gear_ratio,
-            mechanical_efficiency=mechanical_efficiency,
-            num_spindles=num_spindles,
-            friction_coefficient=friction_coefficient,
-            belt_friction_coeff=belt_friction_coeff,
-            wrap_angle=wrap_angle,
-            initial_belt_tension=initial_belt_tension
-        )
-    else:
-        sim_result = modbus_data
-
-    try:
-        db_manager.write_spinning_wheel_data(sim_result)
-    except Exception as e:
-        print(f"Write to DB error: {e}")
-
-    try:
-        alarms = alarm_manager.check_all(sim_result)
-        for alarm in alarms:
-            try:
-                db_manager.write_alarm(alarm)
-            except Exception:
-                pass
-    except Exception as e:
-        print(f"Alarm check error: {e}")
-
-    return sim_result
-
-
+# ============================================================
+# 路由
+# ============================================================
 @app.get("/")
 async def root():
     return {
-        "name": "古代水转大纺车动力学仿真与能效分析系统",
-        "version": "1.1.0",
-        "status": "running",
-        "changes": [
-            "v1.1.0: 引入欧拉皮带打滑公式修正传动扭矩/转速",
-            "v1.1.0: 遗传算法支持4目标交互式权重调整",
-            "v1.1.0: 前端锭子改用InstancedMesh实例化渲染"
-        ],
+        "name": "水转大纺车动力学仿真与能效分析系统（微服务架构）",
+        "version": CFG.get("version", "1.2.0"),
+        "architecture": {
+            "api_gateway": "FastAPI + Redis Pub/Sub",
+            "services": [
+                "modbus_receiver (Modbus TCP 采集)",
+                "dynamics_simulator (动力学+欧拉皮带打滑)",
+                "efficiency_optimizer (遗传算法多目标优化)",
+                "alarm_mqtt (告警检测 + MQTT 推送)",
+            ],
+            "communication": "Redis Pub/Sub",
+            "config_source": "backend/config.yaml",
+        },
+        "redis_connected": bus.ping(),
+        "influxdb_connected": db_manager._client is not None,
         "endpoints": {
             "realtime_data": "/api/data",
             "dynamics_simulation": "/api/dynamics",
             "optimization": "/api/optimize",
             "alarms": "/api/alarms",
-            "websocket": "/api/websocket"
-        }
+            "websocket": "/api/websocket",
+            "health": "/api/health",
+        },
     }
 
 
 @app.get("/api/data")
 async def get_realtime_data(
-    start_time: Optional[str] = Query(None, description="开始时间 ISO格式"),
-    end_time: Optional[str] = Query(None, description="结束时间 ISO格式"),
-    measurement: Optional[str] = Query(None, description="测量类型: water_wheel/transmission/spindle/system/alarm"),
-    limit: int = Query(100, description="返回数据条数限制")
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    measurement: Optional[str] = Query(None),
+    limit: int = Query(100),
 ):
     if not start_time and not end_time and not measurement:
         if latest_data:
             return latest_data
-        else:
-            data = collect_and_process_data()
-            return data
-
+        return {"status": "waiting_for_service", "message": "等待 dynamics_simulator 发布数据..."}
+    if not measurement:
+        raise HTTPException(status_code=400, detail="请指定 measurement 参数")
     try:
-        if measurement:
-            start_dt = datetime.fromisoformat(start_time) if start_time else None
-            end_dt = datetime.fromisoformat(end_time) if end_time else None
-            if start_dt:
-                result = db_manager.query_timerange(measurement, start_dt, end_dt, limit)
-            else:
-                result = db_manager.query_latest_data(measurement, limit)
-            return {"measurement": measurement, "data": result}
+        start_dt = datetime.fromisoformat(start_time) if start_time else None
+        end_dt = datetime.fromisoformat(end_time) if end_time else None
+        if start_dt:
+            data = db_manager.query_timerange(measurement, start_dt, end_dt, limit)
         else:
-            return {"error": "请指定measurement参数"}
+            data = db_manager.query_latest_data(measurement, limit)
+        return {"measurement": measurement, "data": data}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"数据查询失败: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
 
 @app.post("/api/dynamics", response_model=DynamicsResponse)
 async def run_dynamics_simulation(request: DynamicsRequest):
+    """委托 dynamics_simulator 服务执行仿真（request/response 模式）。"""
+    params = request.model_dump()
     try:
-        wrap_angle = math.radians(request.wrap_angle_deg)
-        result = simulator.simulate(
-            water_speed=request.water_speed,
-            blade_angle=request.blade_angle,
-            wheel_radius=request.wheel_radius,
-            gear_ratio=request.gear_ratio,
-            mechanical_efficiency=request.mechanical_efficiency,
-            num_spindles=request.num_spindles,
-            friction_coefficient=request.friction_coefficient,
-            belt_friction_coeff=request.belt_friction_coeff,
-            wrap_angle=wrap_angle,
-            initial_belt_tension=request.initial_belt_tension
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: bus.request(
+                "spinning:sim:request",
+                "simulation_result",
+                params,
+                timeout=RESPONSE_TIMEOUT,
+            ),
         )
+        if result is None:
+            raise HTTPException(status_code=504, detail="dynamics_simulator 服务响应超时")
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"动力学仿真失败: {str(e)}")
 
 
 @app.post("/api/optimize", response_model=OptimizationResult)
 async def run_optimization(request: OptimizationRequest):
+    """委托 efficiency_optimizer 服务执行遗传算法优化（request/response 模式）。"""
+    params = request.model_dump()
     try:
-        result = optimizer.optimize(
-            water_speed=request.water_speed,
-            wheel_radius=request.wheel_radius,
-            gear_ratio=request.gear_ratio,
-            mechanical_efficiency=request.mechanical_efficiency,
-            friction_coefficient=request.friction_coefficient,
-            min_tension=request.min_tension,
-            max_tension=request.max_tension,
-            max_twist_cv=request.max_twist_cv,
-            population_size=request.population_size,
-            generations=request.generations,
-            belt_friction_coeff=request.belt_friction_coeff,
-            wrap_angle_deg=request.wrap_angle_deg,
-            initial_belt_tension=request.initial_belt_tension,
-            weight_energy_efficiency=request.weight_energy_efficiency,
-            weight_production=request.weight_production,
-            weight_twist_uniformity=request.weight_twist_uniformity,
-            weight_low_breakage=request.weight_low_breakage
+        loop = asyncio.get_running_loop()
+        result = await loop.run_in_executor(
+            None,
+            lambda: bus.request(
+                "optimization_request",
+                "optimization_result",
+                params,
+                timeout=max(RESPONSE_TIMEOUT, 600.0),
+            ),
         )
+        if result is None:
+            raise HTTPException(status_code=504, detail="efficiency_optimizer 服务响应超时")
+        if "error" in result:
+            raise HTTPException(status_code=500, detail=result["error"])
         return result
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"优化计算失败: {str(e)}")
 
 
 @app.get("/api/alarms")
 async def get_alarms(
-    start_time: Optional[str] = Query(None, description="开始时间 ISO格式"),
-    end_time: Optional[str] = Query(None, description="结束时间 ISO格式"),
-    alarm_type: Optional[str] = Query(None, description="告警类型"),
-    severity: Optional[str] = Query(None, description="告警级别: info/warning/critical"),
-    limit: int = Query(100, description="返回条数限制")
+    start_time: Optional[str] = Query(None),
+    end_time: Optional[str] = Query(None),
+    alarm_type: Optional[str] = Query(None),
+    severity: Optional[str] = Query(None),
+    limit: int = Query(100),
 ):
     try:
         start_dt = datetime.fromisoformat(start_time) if start_time else None
         end_dt = datetime.fromisoformat(end_time) if end_time else None
-
         db_alarms = db_manager.query_alarms(
-            start_time=start_dt,
-            end_time=end_dt,
-            alarm_type=alarm_type,
-            severity=severity,
-            limit=limit
+            start_time=start_dt, end_time=end_dt,
+            alarm_type=alarm_type, severity=severity, limit=limit,
         )
-
-        if not db_alarms:
-            active_alarms = alarm_manager.get_active_alarms(limit)
-            return {"alarms": active_alarms, "count": len(active_alarms)}
-
-        return {"alarms": db_alarms, "count": len(db_alarms)}
+        if db_alarms:
+            return {"alarms": db_alarms, "count": len(db_alarms), "source": "influxdb"}
+        return {"alarms": latest_alarms[-limit:], "count": len(latest_alarms[-limit:]), "source": "memory"}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"告警查询失败: {str(e)}")
 
 
 @app.websocket("/api/websocket")
 async def websocket_endpoint(websocket: WebSocket):
-    await manager.connect(websocket)
+    await ws_manager.connect(websocket)
     try:
         if latest_data:
             await websocket.send_json({"type": "data", "data": latest_data})
-
         while True:
             data = await websocket.receive_text()
             try:
                 msg = json.loads(data)
-                if msg.get("type") == "ping":
+                mt = msg.get("type")
+                if mt == "ping":
                     await websocket.send_json({"type": "pong", "timestamp": datetime.now().isoformat()})
-                elif msg.get("type") == "get_data":
+                elif mt == "get_data":
                     if latest_data:
                         await websocket.send_json({"type": "data", "data": latest_data})
+                    else:
+                        await websocket.send_json({"type": "data", "data": None, "status": "waiting"})
+                elif mt == "get_alarms":
+                    await websocket.send_json({"type": "alarms", "data": latest_alarms[-50:]})
             except json.JSONDecodeError:
                 pass
     except WebSocketDisconnect:
-        manager.disconnect(websocket)
-    except Exception as e:
-        manager.disconnect(websocket)
-        print(f"WebSocket error: {e}")
+        pass
+    except Exception:
+        pass
+    finally:
+        ws_manager.disconnect(websocket)
 
 
 @app.get("/api/health")
 async def health_check():
     return {
         "status": "healthy",
+        "version": CFG.get("version"),
         "database": "connected" if db_manager._client else "disconnected",
-        "mqtt": "connected" if alarm_manager.is_mqtt_connected() else "disconnected",
-        "modbus": "connected" if modbus_client.is_connected() else "disconnected",
-        "websocket_clients": len(manager.active_connections),
-        "timestamp": datetime.now().isoformat()
+        "redis": "connected" if bus.ping() else "disconnected",
+        "mqtt": "alarm_mqtt 独立服务运行中 (见 docker-compose)",
+        "modbus": "modbus_receiver 独立服务运行中 (见 docker-compose)",
+        "websocket_clients": len(ws_manager.active_connections),
+        "timestamp": datetime.now().isoformat(),
     }
