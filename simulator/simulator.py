@@ -110,11 +110,18 @@ class WaterWheelSimulator:
             self.main_shaft_rpm = 0.0
             return
 
-        theoretical_rpm = self.water_wheel_rpm * BeltDriveConfig.DRIVEN_PULLEY_RATIO
-        slip_factor = 1.0 - BeltDriveConfig.SLIP * (
-            1.0 + random.uniform(-0.1, 0.1)
+        water_torque = (
+            WaterWheelConfig.TORQUE_COEFF
+            * self.water_flow_velocity
+            * WaterWheelConfig.DIAMETER
+            / 2.0
         )
-        self.main_shaft_rpm = theoretical_rpm * slip_factor
+        required_torque = water_torque * BeltDriveConfig.DRIVEN_PULLEY_RATIO
+
+        slip_rate = BeltDriveConfig.calculate_slip_rate(required_torque)
+
+        theoretical_rpm = self.water_wheel_rpm * BeltDriveConfig.DRIVEN_PULLEY_RATIO
+        self.main_shaft_rpm = theoretical_rpm * max(1.0 - slip_rate, 0.0)
 
     def update_spindles(self, dt: float):
         for spindle in self.spindles:
