@@ -37,18 +37,66 @@ class WaterWheelDynamics:
 
 
 class TransmissionSystem:
+    BASE_SLIP_RATE = 0.02
+    PULLEY_RADIUS_DRIVER = 0.3
+    PULLEY_RADIUS_DRIVEN = 0.15
+
+    @classmethod
+    def calculate_critical_torque(cls, belt_friction_coeff: float,
+                                  wrap_angle: float = math.pi,
+                                  initial_tension: float = 200.0,
+                                  pulley_radius: float = 0.15) -> float:
+        if belt_friction_coeff <= 0 or wrap_angle <= 0:
+            return float('inf')
+        e_mu_alpha = math.exp(belt_friction_coeff * wrap_angle)
+        max_force_diff = 2 * initial_tension * (e_mu_alpha - 1) / (e_mu_alpha + 1)
+        critical_torque = max_force_diff * pulley_radius
+        return max(critical_torque, 1.0)
+
+    @classmethod
+    def calculate_slip_rate(cls, required_torque: float, critical_torque: float,
+                            base_slip: float = 0.02) -> float:
+        if critical_torque <= 0:
+            return 1.0
+        if required_torque <= critical_torque:
+            elastic_slip = base_slip * (required_torque / critical_torque)
+            return base_slip * 0.3 + elastic_slip * 0.7
+        else:
+            severe_slip = 1.0 - critical_torque / required_torque
+            return min(0.08 + severe_slip * 0.9, 0.95)
+
     @classmethod
     def calculate_output_torque(cls, input_torque: float, gear_ratio: float,
-                                mechanical_efficiency: float) -> float:
-        return input_torque * gear_ratio * mechanical_efficiency
+                                mechanical_efficiency: float,
+                                belt_friction_coeff: float = 0.35,
+                                wrap_angle: float = math.pi,
+                                initial_tension: float = 200.0,
+                                driven_pulley_radius: float = 0.15) -> Tuple[float, float, float]:
+        critical_torque = cls.calculate_critical_torque(
+            belt_friction_coeff, wrap_angle, initial_tension, driven_pulley_radius
+        )
+
+        theoretical_torque = input_torque * gear_ratio
+
+        if theoretical_torque <= critical_torque:
+            effective_torque = theoretical_torque * mechanical_efficiency
+        else:
+            effective_torque = critical_torque * mechanical_efficiency
+
+        slip_rate = cls.calculate_slip_rate(theoretical_torque, critical_torque)
+        return effective_torque, slip_rate, critical_torque
 
     @classmethod
-    def calculate_output_speed(cls, input_speed: float, gear_ratio: float) -> float:
-        return input_speed * gear_ratio
+    def calculate_output_speed(cls, input_speed: float, gear_ratio: float,
+                               slip_rate: float) -> float:
+        return input_speed * gear_ratio * max(1.0 - slip_rate, 0.0)
 
     @classmethod
-    def calculate_power_loss(cls, input_power: float, mechanical_efficiency: float) -> float:
-        return input_power * (1 - mechanical_efficiency)
+    def calculate_power_loss(cls, input_power: float, mechanical_efficiency: float,
+                             slip_rate: float) -> float:
+        slip_loss = input_power * slip_rate * 0.5
+        friction_loss = input_power * (1 - mechanical_efficiency)
+        return slip_loss + friction_loss
 
 
 class SpindleDynamics:
@@ -133,12 +181,22 @@ class SpinningWheelSimulator:
     def simulate(self, water_speed: float, blade_angle: float,
                  wheel_radius: float, gear_ratio: float,
                  mechanical_efficiency: float, num_spindles: int,
-                 friction_coefficient: float = 0.1) -> Dict[str, Any]:
+                 friction_coefficient: float = 0.1,
+                 belt_friction_coeff: float = 0.35,
+                 wrap_angle: float = math.pi,
+                 initial_belt_tension: float = 200.0) -> Dict[str, Any]:
         wheel_torque = self.water_wheel.calculate_torque(water_speed, blade_angle, wheel_radius)
         wheel_speed = self.water_wheel.calculate_rotational_speed(wheel_torque, wheel_radius)
 
-        output_torque = self.transmission.calculate_output_torque(wheel_torque, gear_ratio, mechanical_efficiency)
-        output_speed = self.transmission.calculate_output_speed(wheel_speed, gear_ratio)
+        output_torque, slip_rate, critical_torque = self.transmission.calculate_output_torque(
+            input_torque=wheel_torque,
+            gear_ratio=gear_ratio,
+            mechanical_efficiency=mechanical_efficiency,
+            belt_friction_coeff=belt_friction_coeff,
+            wrap_angle=wrap_angle,
+            initial_tension=initial_belt_tension
+        )
+        output_speed = self.transmission.calculate_output_speed(wheel_speed, gear_ratio, slip_rate)
 
         spindles = []
         speeds = []
@@ -204,7 +262,11 @@ class SpinningWheelSimulator:
                 "input_torque": wheel_torque,
                 "output_torque": output_torque,
                 "input_speed": wheel_speed,
-                "output_speed": output_speed
+                "output_speed": output_speed,
+                "slip_rate": slip_rate,
+                "critical_torque": critical_torque,
+                "belt_friction_coeff": belt_friction_coeff,
+                "wrap_angle_deg": math.degrees(wrap_angle)
             },
             "spindles": spindles,
             "total_production_rate": total_production,
