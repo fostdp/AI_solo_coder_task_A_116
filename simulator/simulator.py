@@ -1,22 +1,103 @@
 import asyncio
+import os
 import random
+import math
 import time
 import logging
+import argparse
+import sys
+import pymodbus
+from packaging import version
 from pymodbus.server import StartAsyncTcpServer
-from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
-from pymodbus.datastore import ModbusSequentialDataBlock
-from pymodbus.device import ModbusDeviceIdentification
-from config import (
-    ModbusConfig,
-    ReportingConfig,
-    WaterWheelConfig,
-    BeltDriveConfig,
-    SpindleConfig,
-    YarnConfig,
-    PowerConfig,
-    WaterFlowConfig,
-    RegisterMap,
+from pymodbus.datastore import (
+    ModbusSequentialDataBlock,
+    ModbusSparseDataBlock,
 )
+# pymodbus 版本兼容：ModbusDeviceIdentification 的导入路径变化
+try:
+    # 3.5.x / 3.6.x
+    from pymodbus.device import ModbusDeviceIdentification
+except ImportError:
+    # 3.13.x+
+    from pymodbus import ModbusDeviceIdentification
+
+# pymodbus 版本兼容层
+PYMODBUS_VERSION = version.parse(pymodbus.__version__)
+if PYMODBUS_VERSION < version.parse("3.6.0"):
+    # 3.5.x 及以下
+    from pymodbus.datastore import ModbusSlaveContext, ModbusServerContext
+
+    def create_slave_context(holding_registers):
+        return ModbusSlaveContext(hr=holding_registers, zero_mode=True)
+
+    def create_server_context(slaves):
+        return ModbusServerContext(slaves=slaves, single=True)
+
+    def set_slave_values(slave, fc, address, values):
+        """fc: 3 = holding registers, 4 = input registers"""
+        slave.setValues(fc, address, values)
+
+elif PYMODBUS_VERSION < version.parse("3.13.0"):
+    # 3.6.x - 3.12.x
+    from pymodbus.datastore.slave import SlaveContext as ModbusSlaveContext
+    from pymodbus.datastore import ServerContext as ModbusServerContext
+
+    def create_slave_context(holding_registers):
+        sparse = ModbusSparseDataBlock()
+        sparse.setValues(3, 0, [0] * 200)
+        return ModbusSlaveContext(h=sparse)
+
+    def create_server_context(slaves):
+        try:
+            return ModbusServerContext(slaves=slaves, single=True)
+        except TypeError:
+            return ModbusServerContext(slaves=slaves)
+
+    def set_slave_values(slave, fc, address, values):
+        slave.setValues(fc, address, values)
+
+else:
+    # 3.13.0 及以上
+    from pymodbus.datastore import ModbusDeviceContext as ModbusSlaveContext
+    from pymodbus.datastore import ModbusServerContext
+
+    def create_slave_context(holding_registers):
+        return ModbusSlaveContext(hr=holding_registers)
+
+    def create_server_context(slaves):
+        return ModbusServerContext(devices=slaves)
+
+    def set_slave_values(slave, fc, address, values):
+        """fc: 3 = holding registers (hr)"""
+        if fc == 3:
+            slave.setValues("hr", address, values)
+        else:
+            slave.setValues(fc, address, values)
+# config 导入兼容：直接运行时是顶层导入，作为包时是相对导入
+try:
+    from config import (
+        ModbusConfig,
+        ReportingConfig,
+        WaterWheelConfig,
+        BeltDriveConfig,
+        SpindleConfig,
+        YarnConfig,
+        PowerConfig,
+        WaterFlowConfig,
+        RegisterMap,
+    )
+except ImportError:
+    from .config import (
+        ModbusConfig,
+        ReportingConfig,
+        WaterWheelConfig,
+        BeltDriveConfig,
+        SpindleConfig,
+        YarnConfig,
+        PowerConfig,
+        WaterFlowConfig,
+        RegisterMap,
+    )
 
 logging.basicConfig(
     level=logging.INFO,
@@ -37,7 +118,11 @@ class SpindleData:
 
 
 class WaterWheelSimulator:
-    def __init__(self):
+    def __init__(self, water_mode: str = "stable", yarn_spec: str = "cotton_20s"):
+        # 应用预设
+        self.water_preset = WaterFlowConfig.apply_mode(water_mode)
+        self.yarn_preset = YarnConfig.apply_spec(yarn_spec)
+
         self.water_wheel_rpm = 0.0
         self.water_flow_velocity = WaterFlowConfig.VELOCITY
         self.main_shaft_rpm = 0.0
@@ -48,26 +133,76 @@ class WaterWheelSimulator:
         self.start_time = time.time()
         self.last_update_time = time.time()
 
+        # 动态水流模式状态
+        self._cycle_time = 0.0
+        self._surge_remaining = 0.0
+        self._surge_target = None
+
         self.spindles = [SpindleData(i) for i in range(SpindleConfig.COUNT)]
         self.store = self._create_datastore()
-        self.context = ModbusServerContext(slaves=self.store, single=True)
+        self.context = create_server_context(self.store)
 
     def _create_datastore(self):
         holding_registers = ModbusSequentialDataBlock(0, [0] * 200)
-        slave = ModbusSlaveContext(hr=holding_registers, zero_mode=True)
+        slave = create_slave_context(holding_registers)
         return {ModbusConfig.SLAVE_ID: slave}
 
     def _clamp(self, value: float, min_val: float, max_val: float) -> float:
         return max(min_val, min(max_val, value))
 
     def update_water_flow(self, dt: float):
-        target_velocity = WaterFlowConfig.VELOCITY
-        fluctuation = WaterFlowConfig.FLUCTUATION * WaterFlowConfig.VELOCITY
-        noise = random.uniform(-fluctuation, fluctuation)
+        """根据预设的水流模式动态调整流速"""
+        preset = self.water_preset
+        mode = WaterFlowConfig.MODE
+
+        if mode == "cycle_day":
+            # 昼夜正弦周期
+            self._cycle_time += dt
+            ramp = preset.get("ramp_seconds", 300)
+            phase = (self._cycle_time % ramp) / ramp * 2 * math.pi
+            mid = (preset["max_velocity"] + preset["min_velocity"]) / 2
+            amp = (preset["max_velocity"] - preset["min_velocity"]) / 2
+            target_velocity = mid + amp * math.sin(phase)
+
+        elif mode == "random_surge":
+            # 随机洪峰
+            if self._surge_remaining > 0:
+                self._surge_remaining -= dt
+                target_velocity = self._surge_target or preset["base_velocity"]
+                if self._surge_remaining <= 0:
+                    self._surge_target = None
+                    logger.info("洪峰消退，恢复基础流速")
+            else:
+                target_velocity = preset["base_velocity"]
+                surge_prob = preset.get("surge_probability", 0.001)
+                if random.random() < surge_prob:
+                    self._surge_remaining = preset.get("surge_duration", 30)
+                    self._surge_target = random.uniform(
+                        preset["max_velocity"] * 0.7, preset["max_velocity"]
+                    )
+                    logger.warning(
+                        f"洪峰到来！目标流速 {self._surge_target:.2f} m/s，"
+                        f"持续 {self._surge_remaining:.0f} 秒"
+                    )
+
+        else:
+            # 平稳/微波动/湍急/枯水期 - 固定目标速度 + 随机波动
+            target_velocity = preset["base_velocity"]
+
+        # 加入随机噪声
+        fluctuation_amp = preset["fluctuation"] * target_velocity
+        noise = random.uniform(-fluctuation_amp, fluctuation_amp)
+
+        # 平滑过渡，避免突变
+        smooth_factor = min(1.0, dt * 0.5)
+        self.water_flow_velocity = (
+            self.water_flow_velocity * (1 - smooth_factor)
+            + (target_velocity + noise) * smooth_factor
+        )
         self.water_flow_velocity = self._clamp(
-            target_velocity + noise,
-            WaterFlowConfig.MIN_VELOCITY,
-            WaterFlowConfig.MAX_VELOCITY,
+            self.water_flow_velocity,
+            preset["min_velocity"],
+            preset["max_velocity"],
         )
 
     def update_water_wheel(self, dt: float):
@@ -258,51 +393,59 @@ class WaterWheelSimulator:
         slave = self.store[ModbusConfig.SLAVE_ID]
         scale = RegisterMap.REGISTER_SCALE
 
-        slave.setValues(
+        set_slave_values(
+            slave,
             3,
             RegisterMap.WATER_WHEEL_RPM,
             [int(self.water_wheel_rpm * scale)],
         )
-        slave.setValues(
+        set_slave_values(
+            slave,
             3,
             RegisterMap.WATER_FLOW_VELOCITY,
             [int(self.water_flow_velocity * scale)],
         )
 
         rpm_values = [int(s.rpm * scale) for s in self.spindles]
-        slave.setValues(3, RegisterMap.SPINDLE_RPM_START, rpm_values)
+        set_slave_values(slave, 3, RegisterMap.SPINDLE_RPM_START, rpm_values)
 
         tension_values = [int(s.tension * scale) for s in self.spindles]
-        slave.setValues(3, RegisterMap.YARN_TENSION_START, tension_values)
+        set_slave_values(slave, 3, RegisterMap.YARN_TENSION_START, tension_values)
 
         twist_values = [int(s.twist * scale) for s in self.spindles]
-        slave.setValues(3, RegisterMap.YARN_TWIST_START, twist_values)
+        set_slave_values(slave, 3, RegisterMap.YARN_TWIST_START, twist_values)
 
         break_values = [1 if s.is_broken else 0 for s in self.spindles]
-        slave.setValues(3, RegisterMap.YARN_BREAK_START, break_values)
+        set_slave_values(slave, 3, RegisterMap.YARN_BREAK_START, break_values)
 
-        slave.setValues(
+        set_slave_values(
+            slave,
             3,
             RegisterMap.POWER_CONSUMPTION,
             [int(self.power_consumption * scale)],
         )
 
         broken_count = sum(1 for s in self.spindles if s.is_broken)
-        slave.setValues(3, RegisterMap.SPINDLE_BREAK_COUNT, [broken_count])
+        set_slave_values(slave, 3, RegisterMap.SPINDLE_BREAK_COUNT, [broken_count])
 
-        slave.setValues(
+        set_slave_values(
+            slave,
             3,
             RegisterMap.TOTAL_BREAK_COUNT,
             [self.total_break_count],
         )
 
-        slave.setValues(3, RegisterMap.RUN_TIME_HOURS, [self.run_time_hours])
-        slave.setValues(3, RegisterMap.RUN_TIME_MINUTES, [self.run_time_minutes])
+        set_slave_values(slave, 3, RegisterMap.RUN_TIME_HOURS, [self.run_time_hours])
+        set_slave_values(slave, 3, RegisterMap.RUN_TIME_MINUTES, [self.run_time_minutes])
 
     async def simulation_loop(self):
         logger.info("纺车模拟器启动...")
-        logger.info(f"水流速度: {self.water_flow_velocity} m/s")
-        logger.info(f"纱线规格: {YarnConfig.SPEC}")
+        logger.info(f"水流模式: {self.water_preset['name']} [{WaterFlowConfig.MODE}]")
+        logger.info(f"基础流速: {self.water_preset['base_velocity']} m/s")
+        logger.info(f"流速范围: [{self.water_preset['min_velocity']}, {self.water_preset['max_velocity']}] m/s")
+        logger.info(f"纱线规格: {self.yarn_preset['name']} [{YarnConfig.SPEC}]")
+        logger.info(f"额定张力: {YarnConfig.TENSION_NOMINAL:.0f} cN")
+        logger.info(f"断头阈值: {YarnConfig.BREAK_TENSION_THRESHOLD:.0f} cN")
         logger.info(f"上报间隔: {ReportingConfig.INTERVAL_SECONDS} 秒")
 
         last_report_time = time.time()
@@ -344,6 +487,8 @@ class WaterWheelSimulator:
 
         logger.info("=" * 60)
         logger.info(f"运行时间: {self.run_time_hours}小时 {self.run_time_minutes}分钟")
+        logger.info(f"水流模式: {self.water_preset['name']}")
+        logger.info(f"纱线规格: {self.yarn_preset['name']}")
         logger.info(f"水轮转速: {self.water_wheel_rpm:.2f} rpm")
         logger.info(f"水流速度: {self.water_flow_velocity:.2f} m/s")
         logger.info(f"主轴转速: {self.main_shaft_rpm:.2f} rpm")
@@ -398,7 +543,72 @@ async def run_modbus_server(simulator: WaterWheelSimulator):
 
 
 async def main():
-    simulator = WaterWheelSimulator()
+    parser = argparse.ArgumentParser(description="水转大纺车 Modbus TCP 模拟器")
+    parser.add_argument(
+        "--water-mode",
+        type=str,
+        default=os.getenv("WATER_MODE", "stable"),
+        help=f"水流模式: {list(WaterFlowConfig.MODE_PRESETS.keys())}",
+    )
+    parser.add_argument(
+        "--yarn-spec",
+        type=str,
+        default=os.getenv("YARN_SPEC", "cotton_20s"),
+        help=f"纱线规格: {list(YarnConfig.SPEC_PRESETS.keys())}",
+    )
+    parser.add_argument(
+        "--modbus-host",
+        type=str,
+        default=os.getenv("MODBUS_HOST", "0.0.0.0"),
+        help="Modbus TCP 监听地址",
+    )
+    parser.add_argument(
+        "--modbus-port",
+        type=int,
+        default=int(os.getenv("MODBUS_PORT", "5020")),
+        help="Modbus TCP 监听端口",
+    )
+    parser.add_argument(
+        "--report-interval",
+        type=int,
+        default=int(os.getenv("REPORT_INTERVAL", "60")),
+        help="状态上报间隔（秒）",
+    )
+    parser.add_argument(
+        "--list-modes",
+        action="store_true",
+        help="列出所有可用水流模式和纱线规格",
+    )
+    args = parser.parse_args()
+
+    if args.list_modes:
+        print("\n=== 可用水流模式 ===")
+        for key, preset in WaterFlowConfig.MODE_PRESETS.items():
+            print(f"  {key:15s} - {preset['name']}")
+            print(f"    基础流速: {preset['base_velocity']} m/s, "
+                  f"范围: [{preset['min_velocity']}, {preset['max_velocity']}] m/s, "
+                  f"波动: ±{preset['fluctuation']*100:.0f}%")
+        print("\n=== 可用纱线规格 ===")
+        for key, preset in YarnConfig.SPEC_PRESETS.items():
+            print(f"  {key:15s} - {preset['name']}")
+            print(f"    额定张力: {preset['tension_nominal']:.0f} cN, "
+                  f"断头阈值: {preset['break_threshold']:.0f} cN, "
+                  f"额定捻度: {preset['twist_nominal']:.0f} T/m")
+        sys.exit(0)
+
+    # 覆盖配置
+    ModbusConfig.HOST = args.modbus_host
+    ModbusConfig.PORT = args.modbus_port
+    ReportingConfig.INTERVAL_SECONDS = args.report_interval
+
+    try:
+        simulator = WaterWheelSimulator(
+            water_mode=args.water_mode,
+            yarn_spec=args.yarn_spec,
+        )
+    except ValueError as e:
+        logger.error(str(e))
+        sys.exit(1)
 
     server_task = asyncio.create_task(run_modbus_server(simulator))
     sim_task = asyncio.create_task(simulator.simulation_loop())
