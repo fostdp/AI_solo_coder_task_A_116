@@ -23,13 +23,35 @@ class GeneticAlgorithmOptimizer:
             population.append(individual)
         return population
 
+    def _normalize_weights(self, weights: Dict[str, float]) -> Dict[str, float]:
+        total = sum(max(0.0, w) for w in weights.values())
+        if total <= 0:
+            return {
+                "energy_efficiency": 0.7,
+                "production": 0.3,
+                "twist_uniformity": 0.0,
+                "low_breakage": 0.0
+            }
+        return {k: max(0.0, v) / total for k, v in weights.items()}
+
     def fitness_function(self, individual: Dict[str, Any], water_speed: float,
                          wheel_radius: float, gear_ratio: float,
                          mechanical_efficiency: float, friction_coefficient: float,
                          min_tension: float, max_tension: float,
-                         max_twist_cv: float) -> float:
+                         max_twist_cv: float,
+                         weights: Dict[str, float] = None,
+                         belt_friction_coeff: float = 0.35,
+                         wrap_angle_deg: float = 180.0,
+                         initial_belt_tension: float = 200.0) -> float:
+        if weights is None:
+            weights = {"energy_efficiency": 0.7, "production": 0.3,
+                       "twist_uniformity": 0.0, "low_breakage": 0.0}
+        norm_weights = self._normalize_weights(weights)
+
         num_spindles = individual["num_spindles"]
         blade_angle = individual["blade_angle"]
+
+        wrap_angle = math.radians(wrap_angle_deg)
 
         result = simulator.simulate(
             water_speed=water_speed,
@@ -38,7 +60,10 @@ class GeneticAlgorithmOptimizer:
             gear_ratio=gear_ratio,
             mechanical_efficiency=mechanical_efficiency,
             num_spindles=num_spindles,
-            friction_coefficient=friction_coefficient
+            friction_coefficient=friction_coefficient,
+            belt_friction_coeff=belt_friction_coeff,
+            wrap_angle=wrap_angle,
+            initial_belt_tension=initial_belt_tension
         )
 
         spindles = result["spindles"]
@@ -64,7 +89,27 @@ class GeneticAlgorithmOptimizer:
                 penalty += (result["breakage_rate"] - 5.0) * 20
             return result["energy_efficiency"] * 0.1 - penalty
 
-        objective = result["energy_efficiency"] * 0.7 + result["total_production_rate"] * 0.3
+        efficiency_max = 20.0
+        production_max = 80.0
+        twist_cv_best = 0.0
+        twist_cv_worst = max_twist_cv
+        breakage_best = 0.0
+        breakage_worst = 5.0
+
+        score_eff = min(result["energy_efficiency"] / efficiency_max, 1.0)
+        score_prod = min(result["total_production_rate"] / production_max, 1.0)
+        score_twist = 1.0 - (max(result["twist_uniformity_cv"] - twist_cv_best, 0.0)
+                              / max(twist_cv_worst - twist_cv_best, 1e-6))
+        score_break = 1.0 - (max(result["breakage_rate"] - breakage_best, 0.0)
+                              / max(breakage_worst - breakage_best, 1e-6))
+
+        objective = (
+            norm_weights["energy_efficiency"] * score_eff
+            + norm_weights["production"] * score_prod
+            + norm_weights["twist_uniformity"] * score_twist
+            + norm_weights["low_breakage"] * score_break
+        )
+
         return objective
 
     def selection(self, population: List[Dict[str, Any]],
@@ -123,7 +168,22 @@ class GeneticAlgorithmOptimizer:
                  gear_ratio: float, mechanical_efficiency: float,
                  friction_coefficient: float, min_tension: float,
                  max_tension: float, max_twist_cv: float,
-                 population_size: int = 50, generations: int = 100) -> Dict[str, Any]:
+                 population_size: int = 50, generations: int = 100,
+                 belt_friction_coeff: float = 0.35,
+                 wrap_angle_deg: float = 180.0,
+                 initial_belt_tension: float = 200.0,
+                 weight_energy_efficiency: float = 0.7,
+                 weight_production: float = 0.3,
+                 weight_twist_uniformity: float = 0.0,
+                 weight_low_breakage: float = 0.0) -> Dict[str, Any]:
+        weights = {
+            "energy_efficiency": weight_energy_efficiency,
+            "production": weight_production,
+            "twist_uniformity": weight_twist_uniformity,
+            "low_breakage": weight_low_breakage
+        }
+        norm_weights = self._normalize_weights(weights)
+
         population = self.initialize_population(population_size)
         self.convergence_history = []
         best_fitness_all = float('-inf')
@@ -134,7 +194,11 @@ class GeneticAlgorithmOptimizer:
                 self.fitness_function(
                     ind, water_speed, wheel_radius, gear_ratio,
                     mechanical_efficiency, friction_coefficient,
-                    min_tension, max_tension, max_twist_cv
+                    min_tension, max_tension, max_twist_cv,
+                    weights=weights,
+                    belt_friction_coeff=belt_friction_coeff,
+                    wrap_angle_deg=wrap_angle_deg,
+                    initial_belt_tension=initial_belt_tension
                 )
                 for ind in population
             ]
@@ -167,6 +231,7 @@ class GeneticAlgorithmOptimizer:
 
             population = new_population
 
+        wrap_angle = math.radians(wrap_angle_deg)
         final_result = simulator.simulate(
             water_speed=water_speed,
             blade_angle=best_individual_all["blade_angle"],
@@ -174,7 +239,10 @@ class GeneticAlgorithmOptimizer:
             gear_ratio=gear_ratio,
             mechanical_efficiency=mechanical_efficiency,
             num_spindles=best_individual_all["num_spindles"],
-            friction_coefficient=friction_coefficient
+            friction_coefficient=friction_coefficient,
+            belt_friction_coeff=belt_friction_coeff,
+            wrap_angle=wrap_angle,
+            initial_belt_tension=initial_belt_tension
         )
 
         return {
@@ -185,7 +253,8 @@ class GeneticAlgorithmOptimizer:
             "energy_efficiency": final_result["energy_efficiency"],
             "twist_uniformity_cv": final_result["twist_uniformity_cv"],
             "breakage_rate": final_result["breakage_rate"],
-            "convergence_history": self.convergence_history
+            "convergence_history": self.convergence_history,
+            "weights_used": norm_weights
         }
 
 
