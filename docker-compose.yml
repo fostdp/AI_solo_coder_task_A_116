@@ -1,6 +1,12 @@
 version: '3.8'
 
+# ============================================================
+# 水转大纺车系统 - 微服务架构 v1.2.0
+# 通信总线: Redis Pub/Sub
+# ============================================================
+
 services:
+  # ---------- 基础设施 ----------
   influxdb:
     image: influxdb:2.7
     ports:
@@ -9,9 +15,9 @@ services:
       - DOCKER_INFLUXDB_INIT_MODE=setup
       - DOCKER_INFLUXDB_INIT_USERNAME=admin
       - DOCKER_INFLUXDB_INIT_PASSWORD=password123
-      - DOCKER_INFLUXDB_INIT_ORG=spinning-wheel-org
-      - DOCKER_INFLUXDB_INIT_BUCKET=spinning-wheel-data
-      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=my-token
+      - DOCKER_INFLUXDB_INIT_ORG=spinning-org
+      - DOCKER_INFLUXDB_INIT_BUCKET=spinning-bucket
+      - DOCKER_INFLUXDB_INIT_ADMIN_TOKEN=spinning-token
     volumes:
       - influxdb-data:/var/lib/influxdb2
 
@@ -25,7 +31,110 @@ services:
       - mosquitto-data:/mosquitto/data
       - mosquitto-log:/mosquitto/log
 
+  redis:
+    image: redis:7.2-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  # ---------- Modbus 模拟器（可选） ----------
+  # 注: Modbus TCP 模拟器另在 simulator/ 目录，可独立运行
+  #   cd simulator && pip install pymodbus && python simulator.py
+
+  # ---------- 微服务 1: Modbus 采集 ----------
+  modbus-receiver:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "services.modbus_receiver"]
+    environment:
+      - MODBUS_HOST=host.docker.internal
+      - MODBUS_PORT=5020
+      - SPINNING_CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ---------- 微服务 2: 动力学仿真 ----------
+  dynamics-simulator:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "services.dynamics_simulator"]
+    environment:
+      - SPINNING_CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- 微服务 3: 能效优化 ----------
+  efficiency-optimizer:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "services.efficiency_optimizer"]
+    environment:
+      - SPINNING_CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ---------- 微服务 4: 告警 MQTT ----------
+  alarm-mqtt:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["python", "-m", "services.alarm_mqtt"]
+    environment:
+      - SPINNING_CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      mosquitto:
+        condition: service_started
+    restart: unless-stopped
+
+  # ---------- API 网关 ----------
+  api-gateway:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    command: ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
+    ports:
+      - "8000:8000"
+    environment:
+      - SPINNING_CONFIG_PATH=/app/config.yaml
+    volumes:
+      - ./backend/config.yaml:/app/config.yaml:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+      influxdb:
+        condition: service_started
+    restart: unless-stopped
+
 volumes:
   influxdb-data:
   mosquitto-data:
   mosquitto-log:
+  redis-data:
