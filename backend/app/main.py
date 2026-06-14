@@ -197,6 +197,30 @@ async def root():
     }
 
 
+@app.get("/api/health")
+async def health_check():
+    """服务健康检查（供 docker-compose 与 Kubernetes 探针使用。"""
+    redis_ok = bus.ping()
+    influx_ok = False
+    try:
+        if db_manager._client is not None:
+            influx_ok = db_manager._client.ping()
+    except Exception:
+        influx_ok = False
+
+    return {
+        "status": "healthy" if (redis_ok and influx_ok) else "degraded",
+        "version": "v1.2.0",
+        "timestamp": datetime.utcnow().isoformat() + "Z",
+        "services": {
+            "redis": "ok" if redis_ok else "error",
+            "influxdb": "ok" if influx_ok else "error",
+        },
+        "latest_data_available": latest_data is not None,
+        "active_websockets": len(ws_manager.active_connections),
+    }
+
+
 @app.get("/api/data")
 async def get_realtime_data(
     start_time: Optional[str] = Query(None),
